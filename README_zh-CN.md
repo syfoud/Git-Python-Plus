@@ -145,7 +145,7 @@ python GitSDK.py \
 | `--check-only` | 仅检查更新 | `False` |
 
 
-## 🎯 相关 git 代码
+## 🎯 相关 git代码
 
 ```
 1. 仓库管理
@@ -155,8 +155,12 @@ git remote add <name> <url> - 添加远程仓库
 git remote set-url <name> <url> - 设置远程仓库 URL
 3. 分支操作
 git fetch <remote> <branch> - 获取远程分支
+git fetch --depth=<N> <remote> <branch> - 以浅克隆深度获取分支
+git fetch --unshallow - 将浅克隆转换为完整仓库
+git fetch --deepen=<N> - 深化浅克隆深度 N 层
 git checkout <branch> - 切换分支
 git pull --ff-only <remote> <branch> - 快进模式拉取代码
+git pull --ff-only --depth=<N> <remote> <branch> - 以浅克隆深度拉取代码
 4. 重置与回退
 git reset --hard <commit> - 硬重置到指定提交
 git stash - 暂存修改
@@ -170,6 +174,7 @@ git config --local --unset https.proxy - 删除 HTTPS 代理配置
 6. 日志查看
 git log --not --remotes=<remote>/* -1 --oneline - 检查本地独有提交
 git log ..<remote>/<branch> --pretty=format:"%H---%an---%ad---%s" --date=iso -1 - 获取远程最新提交信息
+git log ..<remote>/<branch> --pretty=format:"%an|||%ad|||%s|||%H" --date=iso -1 - 获取格式化远程提交信息
 git --no-pager log --no-merges -1 - 显示最新版本（不含合并提交）
 ```
 

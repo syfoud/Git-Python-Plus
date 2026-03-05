@@ -158,8 +158,12 @@ git remote add <name> <url> - Add remote repository
 git remote set-url <name> <url> - Set remote repository URL
 3. Branch Operations
 git fetch <remote> <branch> - Fetch remote branch
+git fetch --depth=<N> <remote> <branch> - Fetch with shallow clone depth
+git fetch --unshallow - Convert shallow clone to full repository
+git fetch --deepen=<N> - Deepen shallow clone by N layers
 git checkout <branch> - Switch branch
 git pull --ff-only <remote> <branch> - Pull code in fast-forward mode
+git pull --ff-only --depth=<N> <remote> <branch> - Pull with shallow clone depth
 4. Reset and Revert
 git reset --hard <commit> - Hard reset to specified commit
 git stash - Stash modifications
@@ -173,6 +177,7 @@ git config --local --unset https.proxy - Remove HTTPS proxy
 6. Log Viewing
 git log --not --remotes=<remote>/* -1 --oneline - Check local-only commits
 git log ..<remote>/<branch> --pretty=format:"%H---%an---%ad---%s" --date=iso -1 - Get latest remote commit info
+git log ..<remote>/<branch> --pretty=format:"%an|||%ad|||%s|||%H" --date=iso -1 - Get formatted remote commit info
 git --no-pager log --no-merges -1 - Display latest version (without merge commits)
 ```
 
