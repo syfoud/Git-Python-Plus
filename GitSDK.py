@@ -8,9 +8,29 @@ import configparser
 import os
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass
-from typing import Optional, Callable
+from typing import Optional, Callable, Dict, Any, Literal
 from logger import SimpleLogger
+
+@dataclass
+class GitLogInfo:
+    """Git 日志信息数据结构"""
+    author: str = ""
+    date: str = ""
+    message: str = ""
+    commit_hash: str = ""
+    
+    def to_dict(self) -> Dict[str, str]:
+        """转换为字典格式"""
+        return {
+            'author': self.author,
+            'date': self.date,
+            'message': self.message,
+            'commit_hash': self.commit_hash
+        }
+
 
 @dataclass
 class GitConfig:
@@ -37,7 +57,24 @@ class GitConfig:
 
 
 class GitSDK:
-    """Git 仓库py接口"""
+    """Git 仓库 py 接口"""
+    
+    # 类级别的线程池，所有实例共享
+    _executor: Optional[ThreadPoolExecutor] = None
+    
+    @classmethod
+    def _get_executor(cls, max_workers: int = 5) -> ThreadPoolExecutor:
+        """获取或创建线程池"""
+        if cls._executor is None:
+            cls._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="GitSDK")
+        return cls._executor
+    
+    @classmethod
+    def shutdown_executor(cls):
+        """关闭线程池（在程序退出时调用）"""
+        if cls._executor is not None:
+            cls._executor.shutdown(wait=True)
+            cls._executor = None
     
     def __init__(self, config: GitConfig, folder: Optional[str] = None):
         """
@@ -48,7 +85,7 @@ class GitSDK:
         self.config = config
         self.folder = folder or os.getcwd()
         self.logger = SimpleLogger(config.log_callback)
-        # 切换到项目目录以便执行git命令
+        # 切换到项目目录以便执行 git 命令
         os.chdir(self.folder)
         self.git_config = configparser.ConfigParser()
         self.git_config.read('./.git/config')
@@ -87,6 +124,143 @@ class GitSDK:
         else:
             self.logger.warning(f'Git config {section}.{option} != {value}')
             return False
+    
+    def run_async(self, operation: Literal['update', 'check_update', 'deepen', 'get_git_log'], 
+                  callback: Optional[Callable[[Any], None]] = None,
+                  **kwargs) -> Future:
+        """
+        统一的异步操作接口
+        
+        Args:
+            operation: 操作类型，可选：'update', 'check_update', 'deepen', 'get_git_log'
+            callback: 操作完成后的回调函数，接收操作的返回值
+            **kwargs: 传递给具体操作的参数
+            
+        Returns:
+            Future: 代表异步操作结果的 Future 对象
+            
+        Examples:
+            # 异步更新
+            future = sdk.run_async('update', callback=lambda success: print(f'更新{'成功' if success else '失败'}'))
+            
+            # 异步检查更新
+            future = sdk.run_async('check_update', callback=lambda has: print(f'有更新：{has}'))
+            
+            # 异步深化，传递额外参数
+            future = sdk.run_async('deepen', depth=5, callback=lambda r: print('完成'))
+            
+            # 异步获取 git log
+            future = sdk.run_async('get_git_log', callback=lambda log: print(f'最新提交：{log.commit_hash[:8] if log else "无"}'))
+        """
+        executor = self._get_executor()
+        
+        # 映射操作名称到方法
+        operation_map = {
+            'update': self.update,
+            'check_update': self.check_update,
+            'deepen': self.deepen,
+            'get_git_log': self.get_git_log
+        }
+        
+        if operation not in operation_map:
+            raise ValueError(f"未知操作：{operation}，必须是 'update', 'check_update', 'deepen', 'get_git_log' 之一")
+        
+        method = operation_map[operation]
+        
+        def worker():
+            """工作函数"""
+            try:
+                result = method(**kwargs)
+                if callback:
+                    callback(result)
+                return result
+            except Exception as e:
+                self.logger.error(f"Async {operation} failed: {e}")
+                if callback:
+                    callback(None)
+                raise
+        
+        # 提交到线程池
+        self.logger.info(f"Async operation '{operation}' started")
+        return executor.submit(worker)
+    
+    def get_git_log(self, source: str = "origin", branch: Optional[str] = None, count: Optional[int] = None) -> list[GitLogInfo]:
+        """
+        获取 git log 信息列表（支持获取多条历史记录）
+        
+        Args:
+            source: remote 名称
+            branch: 分支名称，默认为配置中的分支
+            count: 获取的日志数量，None 表示获取所有历史
+            
+        Returns:
+            list[GitLogInfo]: GitLogInfo 对象列表，按时间倒序（最新的在前）
+        """
+        if branch is None:
+            branch = self.config.branch
+            
+        # 先 fetch 确保获取最新信息
+        git = self.git
+        if not self.run_cmd(f'"{git}" fetch {source} {branch}', allow_failure=True):
+            self.logger.warning("Failed to fetch from remote")
+            return []
+        
+        # 构建 git log 命令，获取所有远程分支上但本地没有的提交
+        count_param = f"-{count}" if count else ""
+        output = self.run_cmd(
+            f'"{git}" log ..{source}/{branch} --pretty=format:"%an|||%ad|||%s|||%H" --date=iso {count_param}',
+            return_output=True
+        )
+        
+        logs = []
+        if output:
+            # 按行分割，每行是一个提交
+            lines = output.strip().split('\n')
+            for line in lines:
+                if not line.strip():
+                    continue
+                parts = line.split("|||")
+                if len(parts) >= 4:
+                    author, date, message, commit_hash = parts[0], parts[1], parts[2], parts[3]
+                    log_info = GitLogInfo(
+                        author=author,
+                        date=date,
+                        message=message,
+                        commit_hash=commit_hash
+                    )
+                    logs.append(log_info)
+                    self.logger.info(f"Get git log: {commit_hash[:8]} - {message}")
+        
+        # 如果没有远程更新，获取本地提交历史
+        if not logs:
+            local_output = self.run_cmd(
+                f'"{git}" log --pretty=format:"%an|||%ad|||%s|||%H" --date=iso {count_param}',
+                return_output=True
+            )
+            
+            if local_output:
+                lines = local_output.strip().split('\n')
+                for line in lines:
+                    if not line.strip():
+                        continue
+                    parts = line.split("|||")
+                    if len(parts) >= 4:
+                        author, date, message, commit_hash = parts[0], parts[1], parts[2], parts[3]
+                        log_info = GitLogInfo(
+                            author=author,
+                            date=date,
+                            message=message,
+                            commit_hash=commit_hash
+                        )
+                        logs.append(log_info)
+                        self.logger.info(f"Get local git log: {commit_hash[:8]} - {message}")
+        
+        if not logs:
+            self.logger.warning("No git log information available")
+        
+        return logs
+    
+
     
     def run_cmd(self, command: str, allow_failure: bool = False, output: bool = True, return_output: bool = False) -> bool | str:
         """
@@ -346,7 +520,18 @@ class GitSDK:
         return True
 
 
-def git_by_ini(use_dev = False):
+def git_by_ini(use_dev = False, async_mode: bool = False, operation: str = 'check_update'):
+    """
+    从 INI 配置文件读取参数并执行 Git 操作
+    
+    Args:
+        use_dev: 是否使用 dev_config.ini
+        async_mode: 是否使用异步模式（非阻塞）
+        operation: 操作类型，可选：'update', 'check_update', 'get_git_log', 'deepen'
+        
+    Returns:
+        bool|GitLogInfo: 操作结果，get_git_log 返回 GitLogInfo，其他返回 bool
+    """
     # 读取 INI 配置文件，优先读取 dev_config.ini
     config_file = os.path.join(os.path.dirname(__file__), 'dev_config.ini')
     if (not os.path.exists(config_file)) or (not use_dev):
@@ -399,10 +584,25 @@ def git_by_ini(use_dev = False):
         depth,
         project_folder,
     )
-
-    success = updater.update()
-    print(f"更新结果：{'成功' if success else '失败'}\n")
-    return success
+    
+    try:
+        if async_mode:
+            future = updater.run_async(operation, callback=None)
+            result = future.result()
+            return result if result is not None else False
+        else:
+            if operation == 'get_git_log':
+                return updater.get_git_log()
+            elif operation == 'check_update':
+                return updater.check_update()
+            elif operation == 'update':
+                return updater.update()
+            elif operation == 'deepen':
+                return updater.deepen(unshallow=True)
+            else:
+                raise ValueError(f"未知操作：{operation}")
+    finally:
+        updater.shutdown_executor()
 def create(
     repository: str,
     branch: str = 'master',
@@ -469,6 +669,8 @@ if __name__ == '__main__':
     parser.add_argument('--check-only', action='store_true', help='仅检查更新，不执行更新')
     parser.add_argument('--depth', type=int, default=None, help='浅克隆深度')
     parser.add_argument('--unshallow', action='store_true', help='转换为完整仓库（获取所有历史）')
+    parser.add_argument('--async-mode', action='store_true', help='使用异步模式（非阻塞）')
+    parser.add_argument('--get-log', action='store_true', help='获取 git log 信息并输出')
     
     args = parser.parse_args()
     config = GitConfig(
@@ -484,10 +686,46 @@ if __name__ == '__main__':
         depth=args.depth,
     )
     SDK = GitSDK(config, folder=args.folder)
-    if args.check_only:
-        state = SDK.check_update()
-    elif args.unshallow:
-        state=SDK.deepen(unshallow=True)
-    else:
-        state = SDK.update()
+    
+    try:
+        if args.get_log:
+            if args.async_mode:
+                future = SDK.run_async('get_git_log', callback=None)
+                log_info = future.result()
+            else:
+                log_info = SDK.get_git_log()
+            
+            if log_info:
+                print(f"Author: {log_info.author}")
+                print(f"Date:   {log_info.date}")
+                print(f"Message: {log_info.message}")
+                print(f"Commit: {log_info.commit_hash}")
+                sys.exit(0)
+            else:
+                print("Failed to get git log information")
+                sys.exit(1)
+        elif args.check_only:
+            if args.async_mode:
+                future = SDK.run_async('check_update', callback=None)
+                result = future.result()
+                state = True
+            else:
+                state = SDK.check_update()
+        elif args.unshallow:
+            if args.async_mode:
+                future = SDK.run_async('deepen', unshallow=True, callback=None)
+                result = future.result()
+                state = True
+            else:
+                state = SDK.deepen(unshallow=True)
+        else:
+            if args.async_mode:
+                future = SDK.run_async('update', callback=None)
+                result = future.result()
+                state = True
+            else:
+                state = SDK.update()
+    finally:
+        SDK.shutdown_executor()
+    
     sys.exit(0 if state else 1)
