@@ -12,6 +12,12 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass
 from typing import Optional, Callable, Dict, Any, Literal
+
+# 添加当前目录到 sys.path，确保能找到 logger 模块
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+if _current_dir not in sys.path:
+    sys.path.insert(0, _current_dir)
+
 from logger import SimpleLogger
 
 @dataclass
@@ -262,7 +268,7 @@ class GitSDK:
     
 
     
-    def run_cmd(self, command: str, allow_failure: bool = False, output: bool = True, return_output: bool = False) -> bool | str:
+    def run_cmd(self, command: str, allow_failure: bool = False, output: bool = True, return_output: bool = False, auto_input_n: bool = False) -> bool | str:
         """
         执行命令
         
@@ -271,12 +277,47 @@ class GitSDK:
             allow_failure: 是否允许失败
             output: 是否输出日志（仅在 return_output=False 时生效）
             return_output: 是否返回命令输出（True 时返回 stdout）
+            auto_input_n: 是否自动输入 'n' 响应交互式提示（用于 git unlink failed 等情况）
             
         Returns:
             bool | str: 返回布尔值表示成功与否，或当 return_output=True 时返回命令输出
         """
         command = command.replace(r"\\", "/").replace("\\", "/")
         self.logger.info(f'Run command: {command}')
+        
+        # 如果需要自动输入 n，使用管道方式
+        if auto_input_n:
+            # Windows 下使用 echo n | command 的方式
+            # 同时设置 GIT_TERMINAL_PROMPT=0 禁用交互提示
+            # 使用 Popen 和 communicate 来确保输入能正确传递
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,  # 捕获输出用于调试
+                stderr=subprocess.PIPE,  # 捕获错误用于调试
+                text=True,
+                encoding="utf8",
+                shell=True,
+                env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
+            )
+            stdout, stderr = process.communicate()  # 获取输出
+            error_code = process.returncode
+            
+            # 输出错误信息用于调试
+            if error_code and stderr:
+                self.logger.error(f'Command stderr: {stderr}')
+            
+            if error_code:
+                if allow_failure:
+                    self.logger.warning(f'[ Command Error ], error_code: {error_code}')
+                    return False
+                else:
+                    self.logger.info(f'[ Command Error ], error_code: {error_code}')
+                    raise Exception(f"Command failed: {command}")
+            else:
+                self.logger.info(f'[ Command Success ]{command}')
+                return True
+        
         if return_output:
             result = subprocess.run(
                 command, capture_output=True, text=True, encoding="utf8", shell=True
@@ -354,10 +395,10 @@ class GitSDK:
         # 设置代理
         if proxy:
             self.logger.info('Set Git Proxy')
-            if not self.config_eq('http', 'proxy', value=proxy):
-                self.run_cmd(f'"{self.git}" config --local http.proxy {proxy}')
-            if not self.config_eq('https', 'proxy', value=proxy):
-                self.run_cmd(f'"{self.git}" config --local https.proxy {proxy}')
+            if not self.config_eq('http', 'proxy', value=f"http://127.0.0.1:{proxy}"):
+                self.run_cmd(f'"{self.git}" config --local http.proxy http://127.0.0.1:{proxy}')
+            if not self.config_eq('https', 'proxy', value=f"http://127.0.0.1:{proxy}"):
+                self.run_cmd(f'"{self.git}" config --local https.proxy http://127.0.0.1:{proxy}')
         else:
             self.logger.info('No Proxy')
             if not self.config_eq('http', 'proxy', value=None):
@@ -398,23 +439,21 @@ class GitSDK:
         pull_cmd = f'"{self.git}" pull --ff-only {source} {branch}'
         if depth is not None:
             pull_cmd += f' --depth={depth}'
-        
         if keep_changes:
             if self.run_cmd(f'"{self.git}" stash', allow_failure=True):
-                self.run_cmd(pull_cmd)
-                if self.run_cmd(f'"{self.git}" stash pop', allow_failure=True):
-                    pass
-                else:
+                self.run_cmd(pull_cmd, auto_input_n=True)
+                if not self.run_cmd(f'"{self.git}" stash pop', allow_failure=True):
                     self.logger.info('Stash pop failed, no local modifications')
             else:
-                self.logger.info('Stash failed, discarding modifications')
-                self.run_cmd(f'"{self.git}" reset --hard {source}/{branch}')
-                self.run_cmd(pull_cmd)
+                self.logger.warning('Stash failed, maybe first init')
+                self.run_cmd(f'"{self.git}" reset --mixed {source}/{branch}', auto_input_n=True,allow_failure=True)
+                if not self.run_cmd(f'"{self.git}" checkout {branch}', allow_failure=True):
+                    self.run_cmd(pull_cmd, auto_input_n=True)
         else:
-            self.run_cmd(f'"{self.git}" reset --hard {source}/{branch}')
+            self.run_cmd(f'"{self.git}" reset --hard {source}/{branch}', auto_input_n=True)
             # Since `git fetch` is already called, checkout is faster
             if not self.run_cmd(f'"{self.git}" checkout {branch}', allow_failure=True):
-                self.run_cmd(pull_cmd)
+                self.run_cmd(pull_cmd, auto_input_n=True)
         
         # 显示当前分支版本
         self.run_cmd(f'"{self.git}" --no-pager log --no-merges -1')
@@ -520,19 +559,29 @@ class GitSDK:
         return True
 
 
-def git_by_ini(use_dev = False, async_mode: bool = False, operation: str = 'check_update'):
+def git_by_ini(use_dev = None, async_mode: bool = False, operation: str = 'check_update', log_callback = None, keep_changes_override: bool = None):
     """
     从 INI 配置文件读取参数并执行 Git 操作
     
     Args:
-        use_dev: 是否使用 dev_config.ini
+        use_dev: 是否使用 dev_config.ini，None 表示根据 settings.ini 中的 use_dev_config 决定
         async_mode: 是否使用异步模式（非阻塞）
         operation: 操作类型，可选：'update', 'check_update', 'get_git_log', 'deepen'
+        log_callback: 日志回调函数
+        keep_changes_override: 是否保留本地修改的覆盖值（None 表示使用配置文件中的值）
         
     Returns:
         bool|GitLogInfo: 操作结果，get_git_log 返回 GitLogInfo，其他返回 bool
     """
-    # 读取 INI 配置文件，优先读取 dev_config.ini
+    # 如果 use_dev 未指定，从 settings.ini 中读取
+    if use_dev is None:
+        settings_file = os.path.join(os.path.dirname(__file__), 'settings.ini')
+        if os.path.exists(settings_file):
+            parser = configparser.ConfigParser()
+            parser.read(settings_file, encoding='utf-8')
+            use_dev = parser.getboolean('settings', 'use_dev_config', fallback=False)
+    
+    # 根据 use_dev 参数决定使用哪个配置文件
     config_file = os.path.join(os.path.dirname(__file__), 'dev_config.ini')
     if (not os.path.exists(config_file)) or (not use_dev):
         config_file = os.path.join(os.path.dirname(__file__), 'config.ini')
@@ -554,7 +603,11 @@ def git_by_ini(use_dev = False, async_mode: bool = False, operation: str = 'chec
         git_path = os.path.join(os.path.dirname(__file__), git_path).replace('\\', '/')
 
     update = parser.getboolean('update', 'update')
-    keep_changes = parser.getboolean('update', 'keep_changes')
+    # 如果提供了覆盖值则使用覆盖值，否则使用配置文件中的值
+    if keep_changes_override is not None:
+        keep_changes = keep_changes_override
+    else:
+        keep_changes = parser.getboolean('update', 'keep_changes')
     use_mirror = parser.getboolean('update', 'mirror')
     mirror_url = parser.get('update', 'mirror_url', fallback='')
     depth_str = parser.get('update', 'depth', fallback='')
@@ -583,13 +636,14 @@ def git_by_ini(use_dev = False, async_mode: bool = False, operation: str = 'chec
         mirror_url,
         depth,
         project_folder,
+        log_callback,  # 传递日志回调
     )
     
     try:
         if async_mode:
             future = updater.run_async(operation, callback=None)
             result = future.result()
-            return result if result is not None else False
+            return result if result is not None else True  # update() 默认返回 True
         else:
             if operation == 'get_git_log':
                 return updater.get_git_log()
